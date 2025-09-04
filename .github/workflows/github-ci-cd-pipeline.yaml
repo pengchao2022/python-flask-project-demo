@@ -71,6 +71,12 @@ jobs:
     if: github.ref == 'refs/heads/main'
 
     steps:
+    - name: Check Docker Hub credentials
+      run: |
+        echo "Docker Hub Username: ${{ secrets.DOCKERHUB_USERNAME }}"
+        echo "Image Name: ${{ env.DOCKER_IMAGE_NAME }}"
+        echo "Full image tag: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:latest"
+    
     - name: Deploy to EC2 via Bastion with SSH Key
       uses: appleboy/ssh-action@v0.1.6
       with:
