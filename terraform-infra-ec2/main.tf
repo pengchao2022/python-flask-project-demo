@@ -73,7 +73,13 @@ resource "aws_security_group" "ubuntu_private_sg" {
     protocol        = "tcp"
     security_groups = [var.alb_security_group_id]
   }
-
+  ingress {
+    description     = "Allow tcp traffic from flask"
+    from_port       = 5000 # 你的应用监听端口
+    to_port         = 5000
+    protocol        = "tcp"
+    security_groups = [var.alb_security_group_id]
+  }
 
   # Allow all outbound traffic
   egress {
