@@ -45,6 +45,15 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v3
     
+    - name: Debug Docker Hub credentials
+      run: |
+        echo "DOCKERHUB_USERNAME: '$DOCKERHUB_USERNAME'"
+        echo "DOCKER_IMAGE_NAME: '$DOCKER_IMAGE_NAME'"
+        echo "Full image tag would be: $DOCKERHUB_USERNAME/$DOCKER_IMAGE_NAME:latest"
+      env:
+        DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        DOCKER_IMAGE_NAME: ${{ env.DOCKER_IMAGE_NAME }}
+    
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v2
     
@@ -55,15 +64,17 @@ jobs:
         password: ${{ secrets.DOCKERHUB_PASSWORD }}
     
     - name: Build and push Docker images
-      uses: docker/build-push-action@v4
-      with:
-        context: .
-        push: true
-        tags: |
-          ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:latest
-          ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:${{ github.sha }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
+      run: |
+        # 使用传统 docker 命令避免 buildx 格式问题
+        echo "Building Docker image..."
+        docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:latest .
+        docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:${{ github.sha }} .
+        
+        echo "Pushing Docker images..."
+        docker push ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:latest
+        docker push ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:${{ github.sha }}
+        
+        echo "✅ Build and push completed successfully!"
 
   deploy-to-ec2:
     needs: build-and-push
@@ -71,20 +82,27 @@ jobs:
     if: github.ref == 'refs/heads/main'
 
     steps:
-    - name: Check Docker Hub credentials
+    - name: Check required secrets
       run: |
-        echo "Docker Hub Username: ${{ secrets.DOCKERHUB_USERNAME }}"
-        echo "Image Name: ${{ env.DOCKER_IMAGE_NAME }}"
-        echo "Full image tag: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:latest"
+        echo "Checking if all required secrets are set..."
+        echo "BASTION_HOST: ${{ secrets.BASTION_HOST }}"
+        echo "BASTION_USERNAME: ${{ secrets.BASTION_USERNAME }}"
+        echo "EC2_SSH_KEY length: ${#EC2_SSH_KEY}"
+        echo "EC2_USERNAME: ${{ secrets.EC2_USERNAME }}"
+        echo "EC2_HOST: ${{ secrets.EC2_HOST }}"
+      env:
+        EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
     
-    - name: Deploy to EC2 via Bastion with SSH Key
+    - name: Deploy to EC2 via Bastion
       uses: appleboy/ssh-action@v0.1.6
       with:
         host: ${{ secrets.BASTION_HOST }}
         username: ${{ secrets.BASTION_USERNAME }}
-        # 不使用 key 参数，因为Bastion使用已配置的公钥认证
+        key: ${{ secrets.BASTION_SSH_KEY }}  # GitHub Actions需要提供私钥来连接堡垒机
         script: |
           echo "🚀 Starting deployment through Bastion host..."
+          echo "Bastion host: ${{ secrets.BASTION_HOST }}"
+          echo "Target EC2: ${{ secrets.EC2_HOST }}"
           
           # 在Bastion上创建临时SSH密钥文件用于连接目标EC2
           cat > /tmp/ec2_deploy_key << 'KEY_EOF'
@@ -94,21 +112,26 @@ jobs:
           # 设置密钥文件权限
           chmod 600 /tmp/ec2_deploy_key
           
+          # 测试连接到目标EC2
+          echo "Testing connection to target EC2..."
+          ssh -o StrictHostKeyChecking=no -i /tmp/ec2_deploy_key ${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }} "echo '✅ Connected to target EC2 successfully'"
+          
           # 通过Bastion跳转到目标EC2执行部署命令
+          echo "Executing deployment commands on target EC2..."
           ssh -o StrictHostKeyChecking=no -i /tmp/ec2_deploy_key ${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }} << 'DEPLOY_EOF'
           # 在目标EC2上执行部署命令
           echo "📦 Pulling latest Docker image..."
           docker pull ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:latest
           
           echo "🛑 Stopping existing container..."
-          docker stop flask-app || true
-          docker rm flask-app || true
+          docker stop flask-app 2>/dev/null || true
+          docker rm flask-app 2>/dev/null || true
           
           echo "🐳 Starting new container..."
           docker run -d \
             -p 5000:5000 \
-            -e FLASK_SECRET_KEY=${{ secrets.FLASK_SECRET_KEY }} \
-            -e FLASK_ENV=${{ env.FLASK_ENV }} \
+            -e FLASK_SECRET_KEY='${{ secrets.FLASK_SECRET_KEY }}' \
+            -e FLASK_ENV='${{ env.FLASK_ENV }}' \
             --name flask-app \
             --restart unless-stopped \
             ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:latest
@@ -121,10 +144,10 @@ jobs:
           docker ps -a --filter "name=flask-app"
           
           echo "📝 Application logs (last 10 lines):"
-          docker logs flask-app --tail 10
+          docker logs flask-app --tail 10 2>/dev/null || echo "No logs available yet"
           
           echo "🌐 Health check:"
-          curl -s http://localhost:5000/api/health || echo "Health check failed - application may still be starting"
+          curl -s --retry 3 --retry-delay 2 http://localhost:5000/api/health || echo "Health check failed - application may still be starting"
           DEPLOY_EOF
           
           # 清理Bastion上的临时密钥文件
