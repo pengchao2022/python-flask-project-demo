@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Flask Docker App - Automated Deployment</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2c3e50;
+        }
+        .endpoint {
+            background-color: #f9f9f9;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+            border-left: 4px solid #3498db;
+        }
+        .success-badge {
+            background-color: #27ae60;
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            margin-left: 10px;
+        }
+        .code {
+            font-family: monospace;
+            background-color: #f8f9fa;
+            padding: 2px 4px;
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 Flask Docker App - Automated Deployment</h1>
+        <p>This application is automatically deployed using GitHub Actions CI/CD pipeline.</p>
+        
+        <div class="success-badge" style="display: inline-block;">CI/CD Active</div>
+        
+        <h2>📊 Deployment Information:</h2>
+        <ul>
+            <li><strong>Deployment Method:</strong> GitHub Actions → Docker Hub → EC2</li>
+            <li><strong>Trigger:</strong> Push to main branch</li>
+            <li><strong>Status:</strong> <span class="success-badge">Automated</span></li>
+            <li><strong>Environment:</strong> Production</li>
+        </ul>
+        
+        <h2>🔌 Available API Endpoints:</h2>
+        <div class="endpoint">
+            <strong>GET /api/health</strong> - Health check endpoint
+        </div>
+        <div class="endpoint">
+            <strong>GET /api/hello/&lt;name&gt;</strong> - Greeting endpoint
+        </div>
+        <div class="endpoint">
+            <strong>GET /api/info</strong> - Application information
+        </div>
+        
+        <h2>🛠️ How it works:</h2>
+        <ol>
+            <li>Code is pushed to GitHub</li>
+            <li>GitHub Actions automatically runs tests</li>
+            <li>Docker image is built and pushed to Docker Hub</li>
+            <li>Application is deployed to EC2 instance</li>
+            <li>No manual intervention required!</li>
+        </ol>
+    </div>
+</body>
+</html>
