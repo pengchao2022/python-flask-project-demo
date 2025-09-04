@@ -1,4 +1,4 @@
-name: CI/CD Pipeline with Mixed SSH Authentication
+name: CI/CD Pipeline with Mixed SSH Authentication and ALB Integration
 
 on:
   push:
@@ -7,6 +7,8 @@ on:
 env:
   DOCKER_IMAGE_NAME: flask-app
   FLASK_ENV: production
+  ALB_TARGET_GROUP_ARN: ${{ secrets.ALB_TARGET_GROUP_ARN }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}
 
 jobs:
   test:
@@ -65,7 +67,6 @@ jobs:
     
     - name: Build and push Docker images
       run: |
-        # 使用传统 docker 命令避免 buildx 格式问题
         echo "Building Docker image..."
         docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:latest .
         docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:${{ github.sha }} .
@@ -98,28 +99,23 @@ jobs:
       with:
         host: ${{ secrets.BASTION_HOST }}
         username: ${{ secrets.BASTION_USERNAME }}
-        key: ${{ secrets.BASTION_SSH_KEY }}  # GitHub Actions需要提供私钥来连接堡垒机
+        key: ${{ secrets.BASTION_SSH_KEY }}
         script: |
           echo "🚀 Starting deployment through Bastion host..."
           echo "Bastion host: ${{ secrets.BASTION_HOST }}"
           echo "Target EC2: ${{ secrets.EC2_HOST }}"
           
-          # 在Bastion上创建临时SSH密钥文件用于连接目标EC2
           cat > /tmp/ec2_deploy_key << 'KEY_EOF'
           ${{ secrets.EC2_SSH_KEY }}
           KEY_EOF
           
-          # 设置密钥文件权限
           chmod 600 /tmp/ec2_deploy_key
           
-          # 测试连接到目标EC2
           echo "Testing connection to target EC2..."
           ssh -o StrictHostKeyChecking=no -i /tmp/ec2_deploy_key ${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }} "echo '✅ Connected to target EC2 successfully'"
           
-          # 通过Bastion跳转到目标EC2执行部署命令
           echo "Executing deployment commands on target EC2..."
           ssh -o StrictHostKeyChecking=no -i /tmp/ec2_deploy_key ${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }} << 'DEPLOY_EOF'
-          # 在目标EC2上执行部署命令
           echo "📦 Pulling latest Docker image..."
           docker pull ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:latest
           
@@ -150,26 +146,206 @@ jobs:
           curl -s --retry 3 --retry-delay 2 http://localhost:5000/api/health || echo "Health check failed - application may still be starting"
           DEPLOY_EOF
           
-          # 清理Bastion上的临时密钥文件
           rm -f /tmp/ec2_deploy_key
           
           echo "🎉 Deployment through Bastion finished successfully!"
 
+  register-with-alb:
+    needs: deploy-to-ec2
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Install AWS CLI
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y awscli
+        aws --version
+
+    - name: Verify AWS connectivity
+      run: |
+        echo "Testing AWS connectivity..."
+        aws sts get-caller-identity
+        echo "✅ AWS connectivity test passed"
+
+    - name: Get EC2 Instance ID by Private IP
+      id: get-instance-id
+      run: |
+        echo "Looking for EC2 instance with private IP: ${{ secrets.EC2_PRIVATE_IP }}"
+        
+        INSTANCE_ID=$(aws ec2 describe-instances \
+          --filters \
+            "Name=private-ip-address,Values=${{ secrets.EC2_PRIVATE_IP }}" \
+            "Name=instance-state-name,Values=running" \
+          --query "Reservations[].Instances[].InstanceId" \
+          --output text)
+        
+        if [ -z "$INSTANCE_ID" ]; then
+          echo "❌ ERROR: Could not find running EC2 instance with private IP: ${{ secrets.EC2_PRIVATE_IP }}"
+          echo "Available instances in region:"
+          aws ec2 describe-instances \
+            --query "Reservations[].Instances[].[InstanceId, PrivateIpAddress, State.Name]" \
+            --output table
+          exit 1
+        fi
+
+        echo "✅ Found Instance ID: $INSTANCE_ID"
+        echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_OUTPUT
+
+    - name: Verify Target Group exists
+      run: |
+        echo "Verifying Target Group existence: ${{ env.ALB_TARGET_GROUP_ARN }}"
+        
+        TARGET_GROUP_INFO=$(aws elbv2 describe-target-groups \
+          --target-group-arns "${{ env.ALB_TARGET_GROUP_ARN }}" \
+          --query "TargetGroups[0].[TargetGroupName, Protocol, Port, VpcId]" \
+          --output text 2>/dev/null) || true
+        
+        if [ -z "$TARGET_GROUP_INFO" ]; then
+          echo "❌ ERROR: Target Group not found or inaccessible: ${{ env.ALB_TARGET_GROUP_ARN }}"
+          echo "Available Target Groups in region:"
+          aws elbv2 describe-target-groups \
+            --query "TargetGroups[].[TargetGroupArn, TargetGroupName]" \
+            --output table
+          exit 1
+        fi
+
+        echo "✅ Target Group verified: $TARGET_GROUP_INFO"
+
+    - name: Check current target health status
+      run: |
+        echo "Checking current targets in target group..."
+        
+        CURRENT_TARGETS=$(aws elbv2 describe-target-health \
+          --target-group-arn "${{ env.ALB_TARGET_GROUP_ARN }}" \
+          --query "TargetHealthDescriptions[].[Target.Id, TargetHealth.State]" \
+          --output table 2>/dev/null) || true
+        
+        if [ -n "$CURRENT_TARGETS" ]; then
+          echo "Current targets in group:"
+          echo "$CURRENT_TARGETS"
+        else
+          echo "No targets currently registered in this group"
+        fi
+
+    - name: Register EC2 instance with ALB Target Group
+      run: |
+        echo "🚀 Registering instance ${{ steps.get-instance-id.outputs.INSTANCE_ID }} with ALB Target Group"
+        echo "Target Group ARN: ${{ env.ALB_TARGET_GROUP_ARN }}"
+        
+        aws elbv2 register-targets \
+          --target-group-arn "${{ env.ALB_TARGET_GROUP_ARN }}" \
+          --targets "Id=${{ steps.get-instance-id.outputs.INSTANCE_ID }}"
+        
+        echo "✅ Registration command completed successfully"
+
+    - name: Wait for target to become healthy
+      id: health-check
+      run: |
+        echo "⏳ Waiting for target to become healthy. This may take 1-2 minutes..."
+        MAX_ATTEMPTS=12
+        ATTEMPT=1
+        SLEEP_DURATION=10
+        
+        while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+          echo "Health check attempt $ATTEMPT/$MAX_ATTEMPTS (waiting ${SLEEP_DURATION}s between checks)..."
+          
+          HEALTH_INFO=$(aws elbv2 describe-target-health \
+            --target-group-arn "${{ env.ALB_TARGET_GROUP_ARN }}" \
+            --targets "Id=${{ steps.get-instance-id.outputs.INSTANCE_ID }}" \
+            --query "TargetHealthDescriptions[0].[Target.Id, TargetHealth.State, TargetHealth.Reason]" \
+            --output text 2>/dev/null) || HEALTH_INFO=""
+          
+          if [ -n "$HEALTH_INFO" ]; then
+            INSTANCE_ID=$(echo $HEALTH_INFO | awk '{print $1}')
+            HEALTH_STATUS=$(echo $HEALTH_INFO | awk '{print $2}')
+            HEALTH_REASON=$(echo $HEALTH_INFO | awk '{print $3}')
+            
+            echo "Health status: $HEALTH_STATUS"
+            if [ -n "$HEALTH_REASON" ] && [ "$HEALTH_REASON" != "None" ]; then
+              echo "Health reason: $HEALTH_REASON"
+            fi
+            
+            if [ "$HEALTH_STATUS" = "healthy" ]; then
+              echo "🎉 Target is healthy and ready to serve traffic!"
+              echo "ALB_URL=http://$(aws elbv2 describe-load-balancers --query "LoadBalancers[?contains(LoadBalancerArn,'$(echo ${{ env.ALB_TARGET_GROUP_ARN }} | cut -d':' -f6)')].DNSName" --output text)" >> $GITHUB_ENV
+              exit 0
+            elif [ "$HEALTH_STATUS" = "unhealthy" ]; then
+              echo "❌ Target is unhealthy. Reason: $HEALTH_REASON"
+              echo "Please check:"
+              echo "1. Flask application is running on the EC2 instance"
+              echo "2. Health check endpoint is accessible (port 5000)"
+              echo "3. Security groups allow traffic from ALB to EC2 instance"
+              
+              aws elbv2 deregister-targets \
+                --target-group-arn "${{ env.ALB_TARGET_GROUP_ARN }}" \
+                --targets "Id=${{ steps.get-instance-id.outputs.INSTANCE_ID }}"
+              exit 1
+            fi
+          else
+            echo "Health information not available yet..."
+          fi
+          
+          sleep $SLEEP_DURATION
+          ATTEMPT=$((ATTEMPT + 1))
+        done
+        
+        echo "❌ ERROR: Target did not become healthy within $((MAX_ATTEMPTS * SLEEP_DURATION)) seconds"
+        echo "Deregistering unhealthy target..."
+        
+        aws elbv2 deregister-targets \
+          --target-group-arn "${{ env.ALB_TARGET_GROUP_ARN }}" \
+          --targets "Id=${{ steps.get-instance-id.outputs.INSTANCE_ID }}"
+        
+        exit 1
+
+    - name: Display ALB DNS name
+      if: success()
+      run: |
+        echo "🌐 Application is now live and accessible through ALB"
+        echo "ALB DNS Name: $ALB_URL"
+        echo "Full URL: http://$ALB_URL"
+
   notify:
     runs-on: ubuntu-latest
-    needs: deploy-to-ec2
+    needs: [deploy-to-ec2, register-with-alb]
     if: always()
 
     steps:
+    - name: Determine deployment status
+      id: check-status
+      run: |
+        if [ "${{ needs.deploy-to-ec2.result }}" = "success" ] && [ "${{ needs.register-with-alb.result }}" = "success" ]; then
+          echo "STATUS=success" >> $GITHUB_OUTPUT
+          echo "MESSAGE=✅ CI/CD Pipeline completed successfully!" >> $GITHUB_OUTPUT
+        else
+          echo "STATUS=failure" >> $GITHUB_OUTPUT
+          echo "MESSAGE=❌ CI/CD Pipeline failed! Check job logs for details." >> $GITHUB_OUTPUT
+        fi
+
     - name: Notify deployment status
       run: |
-        if [ "${{ job.status }}" = "success" ]; then
-          echo "✅ CI/CD Pipeline completed successfully!"
-          echo "📦 Image: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:latest"
-          echo "🔗 Commit: ${{ github.sha }}"
-          echo "🌐 Deployed to private EC2 via Bastion: ${{ secrets.BASTION_HOST }}"
+        echo "${{ steps.check-status.outputs.MESSAGE }}"
+        echo "📦 Image: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:latest"
+        echo "🔗 Commit: ${{ github.sha }}"
+        echo "🌐 Deployed to EC2: ${{ secrets.EC2_HOST }}"
+        echo "⚖️  ALB Target Group: $(echo ${{ env.ALB_TARGET_GROUP_ARN }} | cut -d'/' -f2)"
+        
+        if [ "${{ steps.check-status.outputs.STATUS }}" = "success" ]; then
+          echo "🎉 Application is now serving production traffic through ALB"
         else
-          echo "❌ CI/CD Pipeline failed!"
-          echo "📋 Please check the workflow logs for details."
+          echo "💥 Deployment failed at:"
+          echo "   - deploy-to-ec2: ${{ needs.deploy-to-ec2.result }}"
+          echo "   - register-with-alb: ${{ needs.register-with-alb.result }}"
           exit 1
         fi
