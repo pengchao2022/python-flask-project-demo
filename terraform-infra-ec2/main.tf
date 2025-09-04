@@ -65,6 +65,15 @@ resource "aws_security_group" "ubuntu_private_sg" {
     protocol    = "tcp"
     cidr_blocks = var.allowed_ssh_cidr_blocks
   }
+  # allow alb traffice
+  ingress {
+    description     = "Allow HTTP traffic from ALB"
+    from_port       = 80 # 你的应用监听端口
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [var.alb_security_group_id]
+  }
+
 
   # Allow all outbound traffic
   egress {

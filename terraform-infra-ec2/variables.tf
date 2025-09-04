@@ -55,3 +55,9 @@ variable "root_volume_size" {
   type        = number
   default     = 20
 }
+
+variable "alb_security_group_id" {
+  description = "The Security Group ID of the ALB that needs to access the EC2 instances."
+  type        = string
+  sensitive   = true 
+}
