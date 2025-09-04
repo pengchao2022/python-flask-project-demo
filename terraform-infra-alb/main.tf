@@ -56,7 +56,7 @@ resource "aws_security_group" "alb_sg" {
 
 # 创建应用负载均衡器
 resource "aws_lb" "public_alb" {
-  name               = "python-public-alb"
+  name               = "public-alb"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb_sg.id]
@@ -72,7 +72,7 @@ resource "aws_lb" "public_alb" {
 # 创建目标组（实例类型）
 resource "aws_lb_target_group" "instance_tg" {
   name        = "instance-target-group"
-  port        = 80
+  port        = 5000
   protocol    = "HTTP"
   vpc_id      = data.aws_vpc.main.id
   target_type = "instance"
@@ -81,7 +81,7 @@ resource "aws_lb_target_group" "instance_tg" {
     enabled             = true
     interval            = 30
     path                = "/"
-    port                = "traffic-port"
+    port                = 5000
     protocol            = "HTTP"
     timeout             = 5
     healthy_threshold   = 3
@@ -90,7 +90,7 @@ resource "aws_lb_target_group" "instance_tg" {
   }
 
   tags = {
-    Name = "python-instance-target-group"
+    Name = "instance-target-group"
   }
 }
 
