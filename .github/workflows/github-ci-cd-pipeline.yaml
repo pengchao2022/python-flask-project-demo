@@ -133,17 +133,31 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:latest
           
           echo "⏳ Waiting for application to start..."
-          sleep 10
+          # 增加应用健康检查，确保应用真正启动
+          for i in {1..10}; do
+            if curl -s --retry 3 --retry-delay 2 http://localhost:5000/api/health > /dev/null 2>&1; then
+              echo "✅ Application health check passed!"
+              break
+            fi
+            echo "Attempt $i/10: Application not ready yet..."
+            sleep 5
+            if [ $i -eq 10 ]; then
+              echo "❌ Application failed to start within 50 seconds"
+              echo "📝 Application logs:"
+              docker logs flask-app || echo "No logs available"
+              exit 1
+            fi
+          done
           
           echo "✅ Deployment completed!"
           echo "📊 Container status:"
           docker ps -a --filter "name=flask-app"
           
-          echo "📝 Application logs (last 10 lines):"
-          docker logs flask-app --tail 10 2>/dev/null || echo "No logs available yet"
+          echo "📝 Application logs (last 20 lines):"
+          docker logs flask-app --tail 20 2>/dev/null || echo "No logs available yet"
           
-          echo "🌐 Health check:"
-          curl -s --retry 3 --retry-delay 2 http://localhost:5000/api/health || echo "Health check failed - application may still be starting"
+          echo "🌐 Final health check:"
+          curl -s -o /dev/null -w "HTTP Status: %{http_code}\n" http://localhost:5000/api/health || echo "Health check failed"
           DEPLOY_EOF
           
           rm -f /tmp/ec2_deploy_key
@@ -216,13 +230,97 @@ jobs:
 
         echo "✅ Target Group verified: $TARGET_GROUP_INFO"
 
+    - name: Check ALB and Target Group configuration
+      id: alb-config-check
+      run: |
+        echo "🔍 Checking ALB and Target Group configuration..."
+        
+        # 获取目标组关联的ALB信息
+        TARGET_GROUP_ARN="${{ env.ALB_TARGET_GROUP_ARN }}"
+        ALB_ARN=$(aws elbv2 describe-target-groups \
+          --target-group-arns "$TARGET_GROUP_ARN" \
+          --query "TargetGroups[0].LoadBalancerArns[0]" \
+          --output text 2>/dev/null || echo "")
+        
+        if [ -z "$ALB_ARN" ]; then
+          echo "❌ Target Group is not associated with any ALB"
+          exit 1
+        fi
+        
+        echo "✅ Target Group is associated with ALB: $(echo $ALB_ARN | cut -d'/' -f2)"
+        echo "ALB_ARN=$ALB_ARN" >> $GITHUB_ENV
+        
+        # 检查监听器配置
+        echo "📡 ALB Listeners:"
+        aws elbv2 describe-listeners \
+          --load-balancer-arn "$ALB_ARN" \
+          --query "Listeners[].[ListenerArn, Port, Protocol]" \
+          --output table
+        
+        # 检查监听器规则是否指向目标组
+        LISTENER_FOUND=false
+        for LISTENER_ARN in $(aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" --query "Listeners[].ListenerArn" --output text); do
+          echo "📋 Checking rules for listener: $(echo $LISTENER_ARN | cut -d'/' -f2)"
+          RULES=$(aws elbv2 describe-rules \
+            --listener-arn "$LISTENER_ARN" \
+            --query "Rules[].Actions[].TargetGroupArn" \
+            --output text)
+          
+          if echo "$RULES" | grep -q "$TARGET_GROUP_ARN"; then
+            echo "✅ Target Group found in listener rules"
+            LISTENER_FOUND=true
+          else
+            echo "ℹ️  Target Group NOT found in this listener's rules"
+          fi
+        done
+        
+        if [ "$LISTENER_FOUND" = false ]; then
+          echo "⚠️  WARNING: Target Group not found in any listener rules"
+          echo "This may cause the 'unused' status if no traffic is routed to this target group"
+        fi
+
+    - name: Verify Security Group configuration
+      run: |
+        echo "🔒 Checking Security Group configuration..."
+        
+        # 获取实例的安全组
+        INSTANCE_ID="${{ steps.get-instance-id.outputs.INSTANCE_ID }}"
+        SECURITY_GROUPS=$(aws ec2 describe-instances \
+          --instance-ids "$INSTANCE_ID" \
+          --query "Reservations[0].Instances[0].SecurityGroups[].GroupId" \
+          --output text)
+        
+        echo "Instance Security Groups: $SECURITY_GROUPS"
+        
+        # 检查安全组是否允许5000端口访问
+        PORT_OPEN=false
+        for SG_ID in $SECURITY_GROUPS; do
+          echo "📋 Checking Security Group $SG_ID for port 5000 access..."
+          PORT_RULES=$(aws ec2 describe-security-groups \
+            --group-ids "$SG_ID" \
+            --query "SecurityGroups[0].IpPermissions[?ToPort==\`5000\`].[FromPort, ToPort, IpRanges[].CidrIp]" \
+            --output text)
+          
+          if [ -n "$PORT_RULES" ]; then
+            echo "✅ Port 5000 is open in Security Group $SG_ID"
+            PORT_OPEN=true
+          else
+            echo "ℹ️  Port 5000 not explicitly open in Security Group $SG_ID"
+          fi
+        done
+        
+        if [ "$PORT_OPEN" = false ]; then
+          echo "⚠️  WARNING: Port 5000 may not be open to ALB traffic"
+          echo "ALB requires access to instance port 5000 for health checks and traffic"
+        fi
+
     - name: Check current target health status
       run: |
         echo "Checking current targets in target group..."
         
         CURRENT_TARGETS=$(aws elbv2 describe-target-health \
           --target-group-arn "${{ env.ALB_TARGET_GROUP_ARN }}" \
-          --query "TargetHealthDescriptions[].[Target.Id, TargetHealth.State]" \
+          --query "TargetHealthDescriptions[].[Target.Id, TargetHealth.State, TargetHealth.Reason]" \
           --output table 2>/dev/null) || true
         
         if [ -n "$CURRENT_TARGETS" ]; then
@@ -237,6 +335,21 @@ jobs:
         echo "🚀 Registering instance ${{ steps.get-instance-id.outputs.INSTANCE_ID }} with ALB Target Group"
         echo "Target Group ARN: ${{ env.ALB_TARGET_GROUP_ARN }}"
         
+        # 先检查是否已经注册
+        EXISTING_TARGET=$(aws elbv2 describe-target-health \
+          --target-group-arn "${{ env.ALB_TARGET_GROUP_ARN }}" \
+          --targets "Id=${{ steps.get-instance-id.outputs.INSTANCE_ID }}" \
+          --query "TargetHealthDescriptions[0].Target.Id" \
+          --output text 2>/dev/null || echo "")
+        
+        if [ "$EXISTING_TARGET" = "${{ steps.get-instance-id.outputs.INSTANCE_ID }}" ]; then
+          echo "ℹ️  Instance is already registered in target group, deregistering first..."
+          aws elbv2 deregister-targets \
+            --target-group-arn "${{ env.ALB_TARGET_GROUP_ARN }}" \
+            --targets "Id=${{ steps.get-instance-id.outputs.INSTANCE_ID }}"
+          sleep 5
+        fi
+        
         aws elbv2 register-targets \
           --target-group-arn "${{ env.ALB_TARGET_GROUP_ARN }}" \
           --targets "Id=${{ steps.get-instance-id.outputs.INSTANCE_ID }}"
@@ -246,8 +359,8 @@ jobs:
     - name: Wait for target to become healthy
       id: health-check
       run: |
-        echo "⏳ Waiting for target to become healthy. This may take 1-2 minutes..."
-        MAX_ATTEMPTS=12
+        echo "⏳ Waiting for target to become healthy. This may take 2-3 minutes..."
+        MAX_ATTEMPTS=18  # 增加到18次尝试（3分钟）
         ATTEMPT=1
         SLEEP_DURATION=10
         
@@ -270,21 +383,34 @@ jobs:
               echo "Health reason: $HEALTH_REASON"
             fi
             
+            # 处理不同的状态
             if [ "$HEALTH_STATUS" = "healthy" ]; then
               echo "🎉 Target is healthy and ready to serve traffic!"
-              echo "ALB_URL=http://$(aws elbv2 describe-load-balancers --query "LoadBalancers[?contains(LoadBalancerArn,'$(echo ${{ env.ALB_TARGET_GROUP_ARN }} | cut -d':' -f6)')].DNSName" --output text)" >> $GITHUB_ENV
+              ALB_DNS=$(aws elbv2 describe-load-balancers \
+                --query "LoadBalancers[?contains(LoadBalancerArn,'$(echo $ALB_ARN | cut -d':' -f6)')].DNSName" \
+                --output text)
+              echo "ALB_URL=$ALB_DNS" >> $GITHUB_ENV
               exit 0
+            elif [ "$HEALTH_STATUS" = "unused" ]; then
+              echo "ℹ️  Target is registered but not receiving traffic yet (normal during warm-up)"
+              # 继续等待，不要退出
             elif [ "$HEALTH_STATUS" = "unhealthy" ]; then
               echo "❌ Target is unhealthy. Reason: $HEALTH_REASON"
               echo "Please check:"
-              echo "1. Flask application is running on the EC2 instance"
-              echo "2. Health check endpoint is accessible (port 5000)"
-              echo "3. Security groups allow traffic from ALB to EC2 instance"
+              echo "1. Flask application is running on port 5000"
+              echo "2. Security groups allow traffic from ALB to EC2 instance"
+              echo "3. Application health check endpoint is working"
               
-              aws elbv2 deregister-targets \
+              # 获取详细的健康检查信息
+              aws elbv2 describe-target-health \
                 --target-group-arn "${{ env.ALB_TARGET_GROUP_ARN }}" \
-                --targets "Id=${{ steps.get-instance-id.outputs.INSTANCE_ID }}"
+                --targets "Id=${{ steps.get-instance-id.outputs.INSTANCE_ID }}" \
+                --output json
               exit 1
+            elif [ "$HEALTH_STATUS" = "initial" ]; then
+              echo "⏳ Target is in initial state (registration in progress)"
+            elif [ "$HEALTH_STATUS" = "draining" ]; then
+              echo "🔄 Target is draining connections"
             fi
           else
             echo "Health information not available yet..."
@@ -295,11 +421,25 @@ jobs:
         done
         
         echo "❌ ERROR: Target did not become healthy within $((MAX_ATTEMPTS * SLEEP_DURATION)) seconds"
-        echo "Deregistering unhealthy target..."
+        echo "Possible reasons:"
+        echo "1. ALB listener not configured to send traffic to this target group"
+        echo "2. Application not responding on port 5000"
+        echo "3. Network/Security Group issues"
+        echo "4. Target Group health check configuration issues"
         
-        aws elbv2 deregister-targets \
+        # 获取更详细的诊断信息
+        echo "🔍 Detailed diagnostic information:"
+        aws elbv2 describe-target-health \
           --target-group-arn "${{ env.ALB_TARGET_GROUP_ARN }}" \
-          --targets "Id=${{ steps.get-instance-id.outputs.INSTANCE_ID }}"
+          --targets "Id=${{ steps.get-instance-id.outputs.INSTANCE_ID }}" \
+          --output json
+        
+        # 检查目标组健康检查配置
+        echo "📋 Target Group health check configuration:"
+        aws elbv2 describe-target-groups \
+          --target-group-arns "${{ env.ALB_TARGET_GROUP_ARN }}" \
+          --query "TargetGroups[0].HealthCheck" \
+          --output json
         
         exit 1
 
@@ -309,6 +449,7 @@ jobs:
         echo "🌐 Application is now live and accessible through ALB"
         echo "ALB DNS Name: $ALB_URL"
         echo "Full URL: http://$ALB_URL"
+        echo "Health Check URL: http://$ALB_URL/api/health"
 
   notify:
     runs-on: ubuntu-latest
@@ -322,6 +463,7 @@ jobs:
         if [ "${{ needs.deploy-to-ec2.result }}" = "success" ] && [ "${{ needs.register-with-alb.result }}" = "success" ]; then
           echo "STATUS=success" >> $GITHUB_OUTPUT
           echo "MESSAGE=✅ CI/CD Pipeline completed successfully!" >> $GITHUB_OUTPUT
+          echo "ALB_URL=$ALB_URL" >> $GITHUB_OUTPUT
         else
           echo "STATUS=failure" >> $GITHUB_OUTPUT
           echo "MESSAGE=❌ CI/CD Pipeline failed! Check job logs for details." >> $GITHUB_OUTPUT
@@ -337,6 +479,7 @@ jobs:
         
         if [ "${{ steps.check-status.outputs.STATUS }}" = "success" ]; then
           echo "🎉 Application is now serving production traffic through ALB"
+          echo "🔗 ALB URL: http://${{ steps.check-status.outputs.ALB_URL }}"
         else
           echo "💥 Deployment failed at:"
           echo "   - deploy-to-ec2: ${{ needs.deploy-to-ec2.result }}"
